@@ -116,20 +116,41 @@ class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
         }
 
         val context = AppContext.instance
-        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                data = Uri.parse("package:${context.packageName}")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
+        val openedSettings = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            openSettings(
+                Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                },
+                Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+            )
         } else {
-            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                data = Uri.parse("package:${context.packageName}")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK
-            }
+            openSettings(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                }
+            )
         }
 
-        runCatching { context.startActivity(intent) }
-        session.displayClientMessage("§l§c[WClient] §r§eGrant storage access, then enable ResourcePackLoad again.")
+        val message = if (openedSettings) {
+            "§l§c[WClient] §r§eGrant storage access, then enable ResourcePackLoad again."
+        } else {
+            "§l§c[WClient] §r§eOpen Android app settings and grant storage access."
+        }
+        displayMessage(message)
+    }
+
+    private fun openSettings(vararg intents: Intent): Boolean {
+        val context = AppContext.instance
+        for (intent in intents) {
+            val opened = runCatching {
+                context.startActivity(intent.apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK })
+            }.isSuccess
+
+            if (opened) {
+                return true
+            }
+        }
+        return false
     }
 
     private fun hasStorageAccess(): Boolean {
@@ -138,6 +159,12 @@ class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
             Environment.isExternalStorageManager()
         } else {
             context.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun displayMessage(message: String) {
+        if (isSessionCreated) {
+            session.displayClientMessage(message)
         }
     }
 
