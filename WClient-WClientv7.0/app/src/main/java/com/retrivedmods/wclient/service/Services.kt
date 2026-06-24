@@ -94,7 +94,7 @@ object Services {
                         captureModeModel.serverPort
                     )
                 ) {
-                    initModules(this)
+                    initModules(this, captureModeModel)
 
                     listeners.add(AutoCodecPacketListener(this))
                     sessionEncryptor?.let {
@@ -131,8 +131,9 @@ object Services {
         }
     }
 
-    private fun initModules(muCuteRelaySession: MuCuteRelaySession) {
-        val session = GameSession(muCuteRelaySession)
+    private fun initModules(muCuteRelaySession: MuCuteRelaySession, captureModeModel: CaptureModeModel) {
+        val serverAddress = "${captureModeModel.serverHostName}_${captureModeModel.serverPort}"
+        val session = GameSession(muCuteRelaySession, serverAddress)
         muCuteRelaySession.listeners.add(session)
 
         for (module in ModuleManager.modules) {

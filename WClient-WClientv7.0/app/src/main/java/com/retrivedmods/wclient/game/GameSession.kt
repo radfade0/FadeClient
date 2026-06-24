@@ -8,7 +8,10 @@ import org.cloudburstmc.protocol.bedrock.packet.BedrockPacket
 import org.cloudburstmc.protocol.bedrock.packet.TextPacket
 
 @Suppress("MemberVisibilityCanBePrivate")
-class GameSession(val muCuteRelaySession: MuCuteRelaySession) : ComposedPacketHandler {
+class GameSession(
+    val muCuteRelaySession: MuCuteRelaySession,
+    val serverAddress: String = "unknown_server"
+) : ComposedPacketHandler {
 
     val localPlayer = LocalPlayer(this)
 

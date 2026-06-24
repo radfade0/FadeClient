@@ -11,21 +11,36 @@ import com.retrivedmods.wclient.application.AppContext
 import com.retrivedmods.wclient.game.InterceptablePacket
 import com.retrivedmods.wclient.game.Module
 import com.retrivedmods.wclient.game.ModuleCategory
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackChunkDataPacket
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePackDataInfoPacket
 import org.cloudburstmc.protocol.bedrock.packet.ResourcePacksInfoPacket
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
+import kotlin.concurrent.thread
 
 class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
 
-    private val saveDirectory = File("/storage/emulated/0/download/WClient")
+    private val saveDirectory: File
+        get() = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "WClient"
+        )
+
+    private val httpClient by lazy { OkHttpClient() }
     private val incomingPacks = HashMap<PackKey, PackState>()
 
     override fun onEnabled() {
         super.onEnabled()
         ensureStorageAccess()
+        if (hasStorageAccess()) {
+            ensureServerDirectory()
+            displayMessage("§l§c[WClient] §r§aResourcePackLoad ready: ${serverZipFile().absolutePath}")
+        }
     }
 
     override fun beforePacketBound(interceptablePacket: InterceptablePacket) {
@@ -41,24 +56,38 @@ class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
     }
 
     override fun onDisconnect(reason: String) {
+        rebuildServerZip()
         incomingPacks.clear()
     }
 
     private fun preparePackList(packet: ResourcePacksInfoPacket) {
-        if (!hasStorageAccess()) {
+        if (!ensureWritable()) {
             return
         }
 
-        packet.resourcePackInfos.forEach { entry ->
-            incomingPacks.putIfAbsent(PackKey(entry.packId, entry.packVersion), PackState())
+        val entries = packet.resourcePackInfos + packet.behaviorPackInfos
+        if (entries.isEmpty()) {
+            displayMessage("§l§c[WClient] §r§7ResourcePackLoad: server did not announce resource packs.")
+            return
         }
-        packet.behaviorPackInfos.forEach { entry ->
-            incomingPacks.putIfAbsent(PackKey(entry.packId, entry.packVersion), PackState())
+
+        displayMessage("§l§c[WClient] §r§eResourcePackLoad: found ${entries.size} server packs.")
+
+        entries.forEach { entry ->
+            val key = PackKey(entry.packId, entry.packVersion)
+            val state = incomingPacks.getOrPut(key) { PackState() }
+            state.file = packFile(entry.packId, entry.packVersion, entry.contentId, entry.subPackName)
+            state.packSize = entry.packSize
+            state.cdnUrl = entry.cdnUrl.orEmpty()
+
+            if (state.cdnUrl.isNotBlank()) {
+                downloadCdnPack(key, state)
+            }
         }
     }
 
     private fun preparePack(packet: ResourcePackDataInfoPacket) {
-        if (!hasStorageAccess()) {
+        if (!ensureWritable()) {
             return
         }
 
@@ -66,29 +95,29 @@ class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
         val state = incomingPacks.getOrPut(key) { PackState() }
         state.chunkCount = packet.chunkCount.toInt()
         state.packSize = packet.compressedPackSize
-        state.file = File(saveDirectory, buildFileName(packet.packId, packet.packVersion))
+        state.file = state.file ?: packFile(packet.packId, packet.packVersion)
         state.receivedChunks.clear()
+        state.complete = false
 
-        saveDirectory.mkdirs()
         state.file?.let { file ->
             if (file.exists()) {
                 file.delete()
             }
         }
+
+        displayMessage("§l§c[WClient] §r§eDownloading pack ${state.safeName}: ${state.chunkCount} chunks.")
     }
 
     private fun saveChunk(packet: ResourcePackChunkDataPacket) {
-        if (!hasStorageAccess()) {
+        if (!ensureWritable()) {
             return
         }
 
         val key = PackKey(packet.packId, packet.packVersion)
         val state = incomingPacks.getOrPut(key) { PackState() }
-        val file = state.file ?: File(saveDirectory, buildFileName(packet.packId, packet.packVersion)).also {
+        val file = state.file ?: packFile(packet.packId, packet.packVersion).also {
             state.file = it
         }
-
-        saveDirectory.mkdirs()
 
         runCatching {
             RandomAccessFile(file, "rw").use { output ->
@@ -96,17 +125,136 @@ class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
                 output.write(packet.data.toByteArray())
                 state.receivedChunks.add(packet.chunkIndex)
 
-                if (state.isComplete) {
-                    if (state.packSize > 0L) {
-                        output.setLength(state.packSize)
-                    }
-                    incomingPacks.remove(key)
-                    session.displayClientMessage("§l§c[WClient] §r§aSaved resource pack: ${file.name}")
+                if (state.isComplete(file)) {
+                    completePack(key, state, file)
                 }
             }
         }.onFailure {
-            session.displayClientMessage("§l§c[WClient] §r§cResource pack save failed: ${it.message}")
+            displayMessage("§l§c[WClient] §r§cResourcePackLoad write failed: ${it.message}")
         }
+    }
+
+    private fun downloadCdnPack(key: PackKey, state: PackState) {
+        if (state.cdnDownloadStarted || state.complete) {
+            return
+        }
+        state.cdnDownloadStarted = true
+
+        thread(name = "ResourcePackLoadCdn") {
+            val file = state.file ?: packFile(key.packId, key.packVersion).also {
+                state.file = it
+            }
+
+            runCatching {
+                val request = Request.Builder()
+                    .url(state.cdnUrl)
+                    .build()
+                val response = httpClient.newCall(request).execute()
+                if (!response.isSuccessful) {
+                    error("HTTP ${response.code}")
+                }
+
+                val body = response.body ?: error("empty response")
+                file.outputStream().use { output ->
+                    body.byteStream().use { input ->
+                        input.copyTo(output)
+                    }
+                }
+
+                completePack(key, state, file)
+            }.onFailure {
+                displayMessage("§l§c[WClient] §r§cCDN pack download failed: ${it.message}")
+            }
+        }
+    }
+
+    private fun completePack(key: PackKey, state: PackState, file: File) {
+        if (state.complete) {
+            return
+        }
+
+        state.complete = true
+        incomingPacks.remove(key)
+        rebuildServerZip()
+        displayMessage("§l§c[WClient] §r§aSaved ${file.name} into ${serverZipFile().name}")
+    }
+
+    private fun rebuildServerZip() {
+        if (!hasStorageAccess()) {
+            return
+        }
+
+        val directory = ensureServerDirectory()
+        val packFiles = directory.listFiles { file ->
+            file.isFile && (file.extension.equals("mcpack", true) || file.extension.equals("zip", true))
+        }?.sortedBy { it.name }.orEmpty()
+
+        if (packFiles.isEmpty()) {
+            return
+        }
+
+        val zipFile = serverZipFile()
+        val tempZipFile = File(zipFile.parentFile, "${zipFile.name}.tmp")
+
+        runCatching {
+            ZipOutputStream(tempZipFile.outputStream()).use { zip ->
+                packFiles.forEach { pack ->
+                    zip.putNextEntry(ZipEntry(pack.name))
+                    pack.inputStream().use { input ->
+                        input.copyTo(zip)
+                    }
+                    zip.closeEntry()
+                }
+            }
+
+            if (zipFile.exists()) {
+                zipFile.delete()
+            }
+            tempZipFile.renameTo(zipFile)
+        }.onFailure {
+            tempZipFile.delete()
+            displayMessage("§l§c[WClient] §r§cServer zip rebuild failed: ${it.message}")
+        }
+    }
+
+    private fun ensureWritable(): Boolean {
+        if (!hasStorageAccess()) {
+            ensureStorageAccess()
+            return false
+        }
+
+        return runCatching {
+            ensureServerDirectory()
+            true
+        }.getOrElse {
+            displayMessage("§l§c[WClient] §r§cCannot create WClient folder: ${it.message}")
+            false
+        }
+    }
+
+    private fun ensureServerDirectory(): File {
+        val root = saveDirectory
+        val directory = File(root, safeServerName())
+        directory.mkdirs()
+        return directory
+    }
+
+    private fun packFile(packId: UUID, packVersion: String, contentId: String = "", subPackName: String = ""): File {
+        val baseName = listOf(contentId, subPackName, packId.toString(), packVersion)
+            .filter { it.isNotBlank() }
+            .joinToString("_")
+        return File(ensureServerDirectory(), "${sanitizeFileName(baseName)}.mcpack")
+    }
+
+    private fun serverZipFile(): File {
+        val root = saveDirectory
+        root.mkdirs()
+        return File(root, "${safeServerName()}.zip")
+    }
+
+    private fun safeServerName(): String {
+        val name = if (isSessionCreated) session.serverAddress else "unknown_server"
+        return sanitizeFileName(name).ifBlank { "unknown_server" }
     }
 
     private fun ensureStorageAccess() {
@@ -168,9 +316,8 @@ class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
         }
     }
 
-    private fun buildFileName(packId: UUID, packVersion: String): String {
-        val cleanVersion = packVersion.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "unknown" }
-        return "${packId}_$cleanVersion.mcpack"
+    private fun sanitizeFileName(value: String): String {
+        return value.replace(Regex("[^A-Za-z0-9._-]"), "_").trim('_')
     }
 
     private fun io.netty.buffer.ByteBuf.toByteArray(): ByteArray {
@@ -185,9 +332,18 @@ class ResourcePackLoadModule : Module("resourcepackload", ModuleCategory.Misc) {
         var chunkCount = 0
         var packSize = 0L
         var file: File? = null
+        var cdnUrl = ""
+        var cdnDownloadStarted = false
+        var complete = false
         val receivedChunks = HashSet<Int>()
 
-        val isComplete: Boolean
-            get() = chunkCount > 0 && receivedChunks.size >= chunkCount
+        val safeName: String
+            get() = file?.name ?: "unknown pack"
+
+        fun isComplete(file: File): Boolean {
+            val chunkComplete = chunkCount > 0 && receivedChunks.size >= chunkCount
+            val sizeComplete = packSize <= 0L || file.length() >= packSize
+            return chunkComplete && sizeComplete
+        }
     }
 }
